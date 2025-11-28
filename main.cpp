@@ -340,8 +340,8 @@ private:
         indices.clear();
         vertices.resize(gridWidth * gridHeight);
 
-        glm::vec3 minBounds(std::numeric_limits<float>::max());
-        glm::vec3 maxBounds(std::numeric_limits<float>::lowest());
+        // Store the incoming height values so we can smooth them before building normals
+        std::vector<float> heights(vertices.size(), 0.0f);
 
         // Populate vertices at the correct grid positions
         for (const auto& p : rawPoints) {
@@ -356,7 +356,46 @@ private:
             Vertex& vertex = vertices[index];
             vertex.pos = glm::vec3(p.x, p.z, -p.y);
             vertex.normal = glm::vec3(0.0f);
+            heights[index] = p.z;
+        }
 
+        // Smooth the height values using a small Gaussian kernel to create a visually smooth surface
+        const float kernel[3][3] = {
+            {1.0f, 2.0f, 1.0f},
+            {2.0f, 4.0f, 2.0f},
+            {1.0f, 2.0f, 1.0f}
+        };
+        const float kernelSum = 16.0f;
+        std::vector<float> smoothedHeights(heights.size(), 0.0f);
+
+        // Run a couple of iterations to gently blur sharp steps without losing overall shape
+        for (int iteration = 0; iteration < 2; ++iteration) {
+            for (size_t y = 0; y < gridHeight; ++y) {
+                for (size_t x = 0; x < gridWidth; ++x) {
+                    float accum = 0.0f;
+                    for (int ky = -1; ky <= 1; ++ky) {
+                        for (int kx = -1; kx <= 1; ++kx) {
+                            size_t sampleX = std::clamp<int>(static_cast<int>(x) + kx, 0, static_cast<int>(gridWidth) - 1);
+                            size_t sampleY = std::clamp<int>(static_cast<int>(y) + ky, 0, static_cast<int>(gridHeight) - 1);
+                            size_t sampleIndex = sampleY * gridWidth + sampleX;
+                            accum += heights[sampleIndex] * kernel[ky + 1][kx + 1];
+                        }
+                    }
+                    smoothedHeights[y * gridWidth + x] = accum / kernelSum;
+                }
+            }
+            heights.swap(smoothedHeights);
+        }
+
+        // Update vertex positions with the smoothed heights
+        for (size_t i = 0; i < vertices.size(); ++i) {
+            vertices[i].pos.y = heights[i];
+        }
+
+        // Compute bounds after smoothing for proper centering and scaling
+        glm::vec3 minBounds(std::numeric_limits<float>::max());
+        glm::vec3 maxBounds(std::numeric_limits<float>::lowest());
+        for (const auto& vertex : vertices) {
             minBounds = glm::min(minBounds, vertex.pos);
             maxBounds = glm::max(maxBounds, vertex.pos);
         }
