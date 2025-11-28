@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <limits> // Added for numeric_limits
 #include <map>
+#include <cmath>
 
 const uint32_t WIDTH = 1280;
 const uint32_t HEIGHT = 720;
@@ -277,37 +278,132 @@ private:
             throw std::runtime_error("Failed to read point count from " + filename);
         }
 
-        vertices.clear();
-        indices.clear();
-        vertices.reserve(totalPoints);
-        indices.reserve(totalPoints);
+        struct RawPoint {
+            float x;
+            float y;
+            float z;
+        };
 
-        glm::vec3 minBounds(std::numeric_limits<float>::max());
-        glm::vec3 maxBounds(std::numeric_limits<float>::lowest());
+        std::vector<RawPoint> rawPoints;
+        rawPoints.reserve(totalPoints);
 
         std::cout << "Loading " << totalPoints << " points from " << filename << "..." << std::endl;
 
         for (size_t i = 0; i < totalPoints; ++i) {
-            float x, y, z;
-            if (!(file >> x >> y >> z)) {
+            RawPoint p{};
+            if (!(file >> p.x >> p.y >> p.z)) {
                 break; // Stop if file ends prematurely
             }
+            rawPoints.push_back(p);
+        }
 
-            Vertex vertex{};
-            vertex.pos = glm::vec3(x, z, -y);
-            // Default normal as raw point clouds usually don't have normals
-            vertex.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+        file.close();
 
-            vertices.push_back(vertex);
-            // Simple linear indexing for points
-            indices.push_back(static_cast<uint32_t>(i));
+        if (rawPoints.empty()) {
+            throw std::runtime_error("No point data found in " + filename);
+        }
 
-            // Track bounds for centering/scaling
+        // Extract unique X and Y coordinates to reconstruct the grid layout
+        auto extractUnique = [](const std::vector<RawPoint>& points, auto selector) {
+            std::vector<float> values;
+            values.reserve(points.size());
+            for (const auto& p : points) {
+                values.push_back(selector(p));
+            }
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end(), [](float a, float b) {
+                return std::fabs(a - b) < 0.001f;
+            }), values.end());
+            return values;
+        };
+
+        std::vector<float> uniqueX = extractUnique(rawPoints, [](const RawPoint& p) { return p.x; });
+        std::vector<float> uniqueY = extractUnique(rawPoints, [](const RawPoint& p) { return p.y; });
+
+        const size_t gridWidth = uniqueX.size();
+        const size_t gridHeight = uniqueY.size();
+
+        if (gridWidth == 0 || gridHeight == 0 || gridWidth * gridHeight != rawPoints.size()) {
+            throw std::runtime_error("Point cloud is not a complete grid; cannot build mesh surface.");
+        }
+
+        auto findIndex = [](const std::vector<float>& values, float target) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (std::fabs(values[i] - target) < 0.001f) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+
+        vertices.clear();
+        indices.clear();
+        vertices.resize(gridWidth * gridHeight);
+
+        glm::vec3 minBounds(std::numeric_limits<float>::max());
+        glm::vec3 maxBounds(std::numeric_limits<float>::lowest());
+
+        // Populate vertices at the correct grid positions
+        for (const auto& p : rawPoints) {
+            int xIndex = findIndex(uniqueX, p.x);
+            int yIndex = findIndex(uniqueY, p.y);
+
+            if (xIndex < 0 || yIndex < 0) {
+                throw std::runtime_error("Failed to map point to grid position.");
+            }
+
+            size_t index = static_cast<size_t>(yIndex) * gridWidth + static_cast<size_t>(xIndex);
+            Vertex& vertex = vertices[index];
+            vertex.pos = glm::vec3(p.x, p.z, -p.y);
+            vertex.normal = glm::vec3(0.0f);
+
             minBounds = glm::min(minBounds, vertex.pos);
             maxBounds = glm::max(maxBounds, vertex.pos);
         }
 
-        file.close();
+        // Build triangle indices for the grid (two triangles per cell)
+        for (size_t y = 0; y + 1 < gridHeight; ++y) {
+            for (size_t x = 0; x + 1 < gridWidth; ++x) {
+                uint32_t topLeft = static_cast<uint32_t>(y * gridWidth + x);
+                uint32_t topRight = static_cast<uint32_t>(y * gridWidth + x + 1);
+                uint32_t bottomLeft = static_cast<uint32_t>((y + 1) * gridWidth + x);
+                uint32_t bottomRight = static_cast<uint32_t>((y + 1) * gridWidth + x + 1);
+
+                // Triangle 1
+                indices.push_back(topLeft);
+                indices.push_back(topRight);
+                indices.push_back(bottomLeft);
+
+                // Triangle 2
+                indices.push_back(topRight);
+                indices.push_back(bottomRight);
+                indices.push_back(bottomLeft);
+            }
+        }
+
+        // Compute smooth vertex normals by accumulating face normals
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            const Vertex& v0 = vertices[indices[i]];
+            const Vertex& v1 = vertices[indices[i + 1]];
+            const Vertex& v2 = vertices[indices[i + 2]];
+
+            glm::vec3 edge1 = v1.pos - v0.pos;
+            glm::vec3 edge2 = v2.pos - v0.pos;
+            glm::vec3 normal = glm::cross(edge1, edge2);
+
+            vertices[indices[i]].normal += normal;
+            vertices[indices[i + 1]].normal += normal;
+            vertices[indices[i + 2]].normal += normal;
+        }
+
+        for (auto& vertex : vertices) {
+            float length = glm::length(vertex.normal);
+            if (length > 0.0f) {
+                vertex.normal /= length;
+            } else {
+                vertex.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+            }
+        }
 
         // Calculate Scale and Center for the Model Matrix
         // We want to scale the model to roughly 20 units in size and center it at (0,0,0)
@@ -325,12 +421,13 @@ private:
         modelMatrix = glm::scale(modelMatrix, glm::vec3(scaleFactor));
         modelMatrix = glm::translate(modelMatrix, -center);
 
-        std::cout << "Loaded " << vertices.size() << " points." << std::endl;
+        std::cout << "Loaded grid: " << gridWidth << " x " << gridHeight << " (" << vertices.size() << " vertices, "
+                  << indices.size() / 3 << " triangles)" << std::endl;
         std::cout << "Bounds: Min(" << minBounds.x << ", " << minBounds.y << ", " << minBounds.z << ") "
                   << "Max(" << maxBounds.x << ", " << maxBounds.y << ", " << maxBounds.z << ")" << std::endl;
-        std::cout << "Applying Scale: " << scaleFactor << " and Centering: " << center.x << ", " << center.y << ", " << center.z << std::endl;
+        std::cout << "Applying Scale: " << scaleFactor << " and Centering: " << center.x << ", " << center.y << ", " << center.z
+                  << std::endl;
     }
-
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
@@ -784,8 +881,8 @@ private:
 
         VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
         inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        // CHANGED: Use POINT_LIST for point cloud visualization
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        // Use triangles to render the reconstructed terrain surface
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         inputAssembly.primitiveRestartEnable = VK_FALSE;
 
         VkViewport viewport{};
